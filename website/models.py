@@ -101,7 +101,10 @@ class Issue(models.Model):
         return service.api_url + template.substitute({'user': self.user, 'project': self.project, 'number': self.number})
 
     def __unicode__(self):
-        return "%s - %s" % (self.number, self.project)
+        return "%s issue #%s" % (self.project, self.number)
+
+    def get_absolute_url(self):
+        return "/issue/%s" % self.id
 
     class Meta:
         ordering = ['-created']
@@ -131,6 +134,7 @@ class Bounty(models.Model):
     price = models.DecimalField(max_digits=10, decimal_places=0)
     ends = models.DateTimeField(null=True, blank=True)
     created = models.DateTimeField(auto_now_add=True)
+    checkout_id = models.IntegerField(null=True)
 
     def time_remaining(self):
         if self.issue.status == Issue.OPEN_STATUS:
@@ -142,46 +146,39 @@ class Bounty(models.Model):
         return msg
    
     def save(self, *args, **kwargs):
-        #if user adds new bounty
 
         if self.pk is None:
             target = self.issue.number
-            action.send(self.user, verb='placed a bounty', target=self)
-
-        if self.pk is not None:
-            previous_price = Bounty.objects.get(pk=self.pk).price
-            target = self.issue.number
-            if self.price != previous_price:
-                action.send(self.user, verb='updated bounty price', target=self)
+            action.send(self.user, verb='placed a $' + str(self.price) + ' bounty on ', target=self.issue)
 
         super(Bounty, self).save(*args, **kwargs)
 
 
 class UserProfile(models.Model):
+    CHOICE_PAYMANT_SERVICE = (
+        ('wepay', u'WePay'),
+    )
+    
     user = models.OneToOneField(User, related_name="userprofile")
     balance = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    payment_service = models.CharField(max_length=255, null=True, blank=True)
+    payment_service = models.CharField(max_length=255, null=True, blank=True, choices=CHOICE_PAYMANT_SERVICE)
     payment_service_email = models.EmailField(max_length=255, null=True, blank=True, default='')
-    #coins = models.IntegerField(default=0)
 
-    @property
-    def gravatar(self, size=28):
+    def avatar(self, size=28):
+        for account in self.user.socialaccount_set.all():
+            if 'avatar_url' in account.extra_data:
+                    return account.extra_data['avatar_url']
+            elif 'picture' in account.extra_data:
+                    return account.extra_data['picture']
+
         gravatar_url = "http://www.gravatar.com/avatar.php?"
         gravatar_url += urllib.urlencode({'gravatar_id': hashlib.md5(self.user.email.lower()).hexdigest(), 'default': 'retro', 'size': str(size)})
         return gravatar_url
 
-
-    @property
-    def gravatar_large(self, size=200):
-        gravatar_url = "http://www.gravatar.com/avatar.php?"
-        gravatar_url += urllib.urlencode({'gravatar_id': hashlib.md5(self.user.email.lower()).hexdigest(), 'default': 'retro', 'size': str(size)})
-        return gravatar_url
-
-    def gravatar_winner(self, size=23):
-        return self.gravatar(size=23)
+    def avatar_large(self, size=200):
+        return self.avatar(size=200)
 
     def save(self, *args, **kwargs):
-        #if new user signs up add it to the activity feed
         if self.pk is None:
             action.send(self.user, verb='signed up')
         super(UserProfile, self).save(*args, **kwargs)

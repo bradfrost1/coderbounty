@@ -4,9 +4,10 @@ from django.core.mail import send_mail
 from django.conf import settings
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
+from django.contrib.messages.views import SuccessMessageMixin
 from models import Issue, UserProfile, Bounty, Service
 from .forms import IssueCreateForm, BountyCreateForm, UserProfileForm
-from utils import get_issue, add_issue_to_database, get_twitter_count, get_facebook_count, create_comment, issue_counts, leaderboard, get_hexdigest
+from utils import get_issue, add_issue_to_database, get_twitter_count, get_facebook_count, create_comment, issue_counts, leaderboard, get_hexdigest, post_to_slack
 
 from django.views.generic import ListView, DetailView, FormView
 from django.views.generic.edit import UpdateView
@@ -37,6 +38,10 @@ from actstream.models import Action
 
 from django.core.urlresolvers import reverse
 
+def parse_url_ajax(request):
+     url = request.POST.get('url', '')
+     issue = get_issue(request, url)
+     return HttpResponse(json.dumps(issue))
 
 def home(request, template="index.html"):
     activities = Action.objects.all()[0:10]
@@ -72,7 +77,7 @@ def create_issue_and_bounty(request):
         issue_data = get_issue(request, url)
         if issue_data:
             service = Service.objects.get(name=issue_data['service'])
-            instance = Issue(created = user,number = issue_data['number'],
+            instance = Issue(number = issue_data['number'],
             project=issue_data['project'],user = issue_data['user'],service=service)
         else:
             return render(request, 'post.html', {
@@ -83,18 +88,18 @@ def create_issue_and_bounty(request):
         bounty_form = BountyCreateForm(request.POST)
         bounty_form_is_valid = bounty_form.is_valid()
         if form.is_valid() and bounty_form_is_valid:
-            if not instance.pk: 
+            try:
                 issue = form.save()
-            else:
-                issue = instance
-                #issue already exists, post additional bounty
-                #this doesn't seem to be working yet
+            except:
+                issue = Issue.objects.get(number = issue_data['number'], 
+                    project=issue_data['project'],user = issue_data['user'],service=service)
+                #issue exists
             price = bounty_form.cleaned_data['price']
-            bounty_instance = Bounty(user = user,issue = issue,price = price)
-            #save this data and post it with the return_uri from wepay
-            data = serializers.serialize('xml', [ bounty_instance, ])
-            bounty_instance.save()
 
+            bounty_instance = Bounty(user = user,issue = issue,price = price)
+            
+            data = serializers.serialize('xml', [ bounty_instance, ])
+            
             wepay = WePay(settings.WEPAY_IN_PRODUCTION, settings.WEPAY_ACCESS_TOKEN)
             wepay_data = wepay.call('/checkout/create', {
                 'account_id': settings.WEPAY_ACCOUNT_ID,
@@ -102,16 +107,17 @@ def create_issue_and_bounty(request):
                 'short_description': 'CoderBounty',
                 'long_description': data,
                 'type': 'service',
+                'redirect_uri': request.build_absolute_uri(issue.get_absolute_url()),
                 'currency': 'USD'
             })
-            print wepay_data
+            if "error_code" in wepay_data:
+                messages.error(request, wepay_data['error_description'])
+                return render(request, 'post.html', {
+                    'languages': languages
+                })
 
-            #return redirect(wepay_data['checkout_uri'])
+            return redirect(wepay_data['checkout_uri'])
 
-            return render(request, 'post.html', {
-                'languages': languages,
-                'message':'Successfully saved issue'
-            })
         else:
             return render(request, 'post.html', {
                 'languages': languages,
@@ -415,16 +421,32 @@ class UserProfileDetailView(DetailView):
         return context
 
 
-class UserProfileEditView(UpdateView):
+class UserProfileEditView(SuccessMessageMixin, UpdateView):
     model = UserProfile
     form_class = UserProfileForm
     template_name = "profiles/edit.html"
+    success_message = 'Profile saved'
 
     def get_object(self, queryset=None):
         return UserProfile.objects.get_or_create(user=self.request.user)[0]
 
     def get_success_url(self):
-        return reverse("profile", kwargs={'slug': self.request.user})
+        # return reverse("profile", kwargs={'slug': self.request.user})
+        return reverse("edit_profile")
+
+    def form_valid(self, form):
+        user_id = form.cleaned_data.get("user")
+        user = User.objects.get(id=user_id)
+        user.first_name = form.cleaned_data.get("first_name")
+        user.last_name = form.cleaned_data.get("last_name")
+        user.email = form.cleaned_data.get("email")
+        user.save()
+        
+        return super(UserProfileEditView, self).form_valid(form)
+
+    def get_success_message(self, cleaned_data):
+        return self.success_message 
+
 
 
 # def load_issue(request):
@@ -448,6 +470,23 @@ class IssueDetailView(DetailView):
     model = Issue
     slug_field = "id"
     template_name = "issue.html"
+
+    def get(self, request, *args, **kwargs):
+        if self.request.GET.get('checkout_id'):
+            wepay = WePay(settings.WEPAY_IN_PRODUCTION, settings.WEPAY_ACCESS_TOKEN)
+            wepay_data = wepay.call('/checkout/', {
+                'checkout_id': self.request.GET.get('checkout_id'),
+            })
+            
+            for obj in serializers.deserialize("xml", wepay_data['long_description'], ignorenonexistent=True):
+                obj.object.created = datetime.datetime.now()
+                obj.object.checkout_id = self.request.GET.get('checkout_id')
+                obj.save()
+            	post_to_slack(obj.object)
+
+        
+        return super(IssueDetailView, self).get(request, *args, **kwargs)
+
 
     def get_context_data(self, **kwargs):
         context = super(IssueDetailView, self).get_context_data(**kwargs)
